@@ -9,7 +9,7 @@ from typing import List, Dict
 # --- CONFIGURATION ---
 DB_PATH = "mnemosyne_conversations.db"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL_NAME = "llama-3.1-70b-versatile"
+MODEL_NAME = "llama-3.1-8b-instant"
 
 # --- API KEY LOADER ---
 def get_api_key():
@@ -339,3 +339,4 @@ This conversational AI system is designed for research in therapeutic dialogue a
 
 st.markdown("---")
 st.caption(f"🔧 Engine: {MODEL_NAME} (Groq) | 💾 Database: {DB_PATH}")
+
