@@ -1,5 +1,6 @@
 import streamlit as st
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import pandas as pd
 import requests
 import datetime
@@ -7,7 +8,6 @@ import json
 from typing import List, Dict
 
 # --- CONFIGURATION ---
-DB_PATH = "mnemosyne_conversations.db"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL_NAME = "llama-3.1-8b-instant"
 
@@ -21,50 +21,155 @@ def get_api_key():
         pass
     return st.session_state.get("groq_api_key", "")
 
-# --- DATABASE ---
+# --- POSTGRESQL CONNECTION ---
+def get_db_connection():
+    """Get PostgreSQL connection from secrets"""
+    try:
+        return psycopg2.connect(
+            host=st.secrets["postgres"]["host"],
+            database=st.secrets["postgres"]["database"],
+            user=st.secrets["postgres"]["user"],
+            password=st.secrets["postgres"]["password"],
+            port=st.secrets["postgres"]["port"]
+        )
+    except Exception as e:
+        st.error(f"Database connection failed: {e}")
+        return None
+
+# --- DATABASE INIT ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT, ended_at TEXT, session_type TEXT, patient_id TEXT, summary TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS conversation_turns (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, timestamp TEXT, speaker TEXT, message TEXT, message_type TEXT, metadata TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS memory_anchors (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, timestamp TEXT, category TEXT, original_text TEXT, reframed_text TEXT, emotional_valence REAL)''')
-    conn.commit()
-    conn.close()
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS sessions (
+            id SERIAL PRIMARY KEY,
+            started_at TIMESTAMP,
+            ended_at TIMESTAMP,
+            session_type TEXT,
+            patient_id TEXT,
+            summary TEXT
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS conversation_turns (
+            id SERIAL PRIMARY KEY,
+            session_id INTEGER REFERENCES sessions(id),
+            timestamp TIMESTAMP,
+            speaker TEXT,
+            message TEXT,
+            message_type TEXT,
+            metadata TEXT
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS memory_anchors (
+            id SERIAL PRIMARY KEY,
+            session_id INTEGER REFERENCES sessions(id),
+            timestamp TIMESTAMP,
+            category TEXT,
+            original_text TEXT,
+            reframed_text TEXT,
+            emotional_valence REAL
+        )''')
+        conn.commit()
+    except Exception as e:
+        st.error(f"Database init failed: {e}")
+    finally:
+        conn.close()
 
 def create_session(session_type, patient_id="anonymous"):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO sessions (started_at, session_type, patient_id) VALUES (?, ?, ?)", (datetime.datetime.now().isoformat(), session_type, patient_id))
-    sid = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return sid
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sessions (started_at, session_type, patient_id) VALUES (%s, %s, %s) RETURNING id",
+                    (datetime.datetime.now(), session_type, patient_id))
+        sid = cur.fetchone()[0]
+        conn.commit()
+        return sid
+    except Exception as e:
+        st.error(f"Session creation failed: {e}")
+        return None
+    finally:
+        conn.close()
 
 def end_session(session_id, summary):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("UPDATE sessions SET ended_at = ?, summary = ? WHERE id = ?", (datetime.datetime.now().isoformat(), summary, session_id))
-    conn.commit()
-    conn.close()
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE sessions SET ended_at = %s, summary = %s WHERE id = %s",
+                    (datetime.datetime.now(), summary, session_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 def save_turn(session_id, speaker, message, message_type="dialogue", metadata=None):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("INSERT INTO conversation_turns (session_id, timestamp, speaker, message, message_type, metadata) VALUES (?, ?, ?, ?, ?, ?)", (session_id, datetime.datetime.now().isoformat(), speaker, message, message_type, json.dumps(metadata or {})))
-    conn.commit()
-    conn.close()
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO conversation_turns (session_id, timestamp, speaker, message, message_type, metadata) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (session_id, datetime.datetime.now(), speaker, message, message_type, json.dumps(metadata or {})))
+        conn.commit()
+    finally:
+        conn.close()
 
 def get_session_history(session_id):
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT timestamp, speaker, message, message_type, metadata FROM conversation_turns WHERE session_id = ? ORDER BY id ASC", conn, params=(session_id,))
-    conn.close()
-    return df.to_dict('records')
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT timestamp, speaker, message, message_type, metadata FROM conversation_turns WHERE session_id = %s ORDER BY id ASC", (session_id,))
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 def get_all_sessions():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT id, started_at, ended_at, session_type, patient_id, summary FROM sessions ORDER BY id DESC", conn)
-    conn.close()
-    return df
+    conn = get_db_connection()
+    if not conn:
+        return pd.DataFrame()
+    try:
+        df = pd.read_sql_query("SELECT id, started_at, ended_at, session_type, patient_id, summary FROM sessions ORDER BY id DESC", conn)
+        return df
+    finally:
+        conn.close()
+
+# --- SESSION IMPORT ---
+def import_session_from_json(json_data):
+    """Import a session from exported JSON file"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        history = json_data.get("history", [])
+        if not history:
+            return None
+        
+        # Create new session
+        cur = conn.cursor()
+        first_turn = history[0]
+        session_type = first_turn.get("message", "").replace("Session started: ", "") if first_turn.get("speaker") == "SYSTEM" else "Imported Session"
+        
+        cur.execute("INSERT INTO sessions (started_at, session_type, patient_id) VALUES (%s, %s, %s) RETURNING id",
+                    (datetime.datetime.now(), session_type, "imported"))
+        new_session_id = cur.fetchone()[0]
+        
+        # Import all turns
+        for turn in history:
+            cur.execute("INSERT INTO conversation_turns (session_id, timestamp, speaker, message, message_type, metadata) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (new_session_id, turn.get("timestamp", datetime.datetime.now()), turn["speaker"], turn["message"], turn.get("message_type", "dialogue"), turn.get("metadata", "{}")))
+        
+        conn.commit()
+        return new_session_id
+    except Exception as e:
+        st.error(f"Import failed: {e}")
+        return None
+    finally:
+        conn.close()
 
 # --- THERAPEUTIC SYSTEMS ---
 THERAPEUTIC_SYSTEMS = {
@@ -188,17 +293,15 @@ for key, val in [('current_session_id', None), ('session_history', []), ('therap
         st.session_state[key] = val
 
 st.title("🏛️ Mnemosyne: Conversational Therapeutic AI")
-st.caption("Research prototype for trauma processing and cognitive reframing | Powered by Groq")
+st.caption("Research prototype for trauma processing and cognitive reframing | Powered by Groq + PostgreSQL")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🔑 API Configuration")
-
     GROQ_API_KEY = get_api_key()
 
     if GROQ_API_KEY:
         st.success("✓ API Key configured")
-        st.caption("Running in production mode")
     else:
         manual_key = st.text_input("Groq API Key", type="password", value=st.session_state.groq_api_key, help="Get your free key at https://console.groq.com/keys")
         if manual_key:
@@ -207,7 +310,22 @@ with st.sidebar:
             st.success("✓ API Key entered")
         else:
             st.warning("⚠️ Enter your Groq API key to start")
-            st.markdown("[Get Free API Key →](https://console.groq.com/keys)")
+
+    st.markdown("---")
+    st.header("📥 Import Session")
+    uploaded_file = st.file_uploader("Upload session JSON", type=['json'])
+    if uploaded_file:
+        try:
+            json_data = json.load(uploaded_file)
+            if st.button("📂 Import & Continue Session"):
+                imported_id = import_session_from_json(json_data)
+                if imported_id:
+                    st.session_state.current_session_id = imported_id
+                    st.session_state.session_history = get_session_history(imported_id)
+                    st.success(f"✓ Session imported! Session #{imported_id}")
+                    st.rerun()
+        except Exception as e:
+            st.error(f"Invalid JSON: {e}")
 
     st.markdown("---")
     st.header("🎯 Session Control")
@@ -244,12 +362,13 @@ with st.sidebar:
 
         if st.button("▶️ Start New Session", use_container_width=True, disabled=not GROQ_API_KEY):
             sid = create_session(session_type, patient_id)
-            st.session_state.current_session_id = sid
-            st.session_state.session_history = []
-            st.session_state.therapeutic_mode = "exploratory_dialogue"
-            save_turn(sid, "SYSTEM", f"Session started: {session_type}", "session_start")
-            save_turn(sid, "THERAPIST", "Hello, I'm here to listen and support you. This is a safe space to explore whatever is on your mind. What would you like to talk about today?", "greeting")
-            st.rerun()
+            if sid:
+                st.session_state.current_session_id = sid
+                st.session_state.session_history = []
+                st.session_state.therapeutic_mode = "exploratory_dialogue"
+                save_turn(sid, "SYSTEM", f"Session started: {session_type}", "session_start")
+                save_turn(sid, "THERAPIST", "Hello, I'm here to listen and support you. This is a safe space to explore whatever is on your mind. What would you like to talk about today?", "greeting")
+                st.rerun()
 
     st.markdown("---")
     st.subheader("📚 Past Sessions")
@@ -257,12 +376,12 @@ with st.sidebar:
 
     if not all_sessions.empty:
         for _, session in all_sessions.head(5).iterrows():
-            status = "✓" if session['ended_at'] else "⏸"
+            status = "✓" if pd.notna(session['ended_at']) else "⏸"
             with st.expander(f"{status} Session #{session['id']} - {session['session_type']}", expanded=False):
-                st.caption(f"Started: {session['started_at'][:16]}")
-                if session['ended_at']:
-                    st.caption(f"Ended: {session['ended_at'][:16]}")
-                if session['summary']:
+                st.caption(f"Started: {str(session['started_at'])[:16]}")
+                if pd.notna(session['ended_at']):
+                    st.caption(f"Ended: {str(session['ended_at'])[:16]}")
+                if pd.notna(session['summary']):
                     st.write(session['summary'])
                 if st.button(f"Load Session #{session['id']}", key=f"load_{session['id']}"):
                     st.session_state.current_session_id = int(session['id'])
@@ -296,11 +415,11 @@ if st.session_state.current_session_id:
 
     if send_button and patient_input.strip():
         save_turn(st.session_state.current_session_id, "PATIENT", patient_input.strip(), "dialogue")
-        st.session_state.session_history.append({'speaker': 'PATIENT', 'message': patient_input.strip(), 'message_type': 'dialogue', 'timestamp': datetime.datetime.now().isoformat()})
+        st.session_state.session_history.append({'speaker': 'PATIENT', 'message': patient_input.strip(), 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
         with st.spinner("Therapist is responding..."):
             ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
         save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
-        st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now().isoformat()})
+        st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
         st.rerun()
 
     st.markdown("### ⚡ Quick Actions")
@@ -320,23 +439,23 @@ if st.session_state.current_session_id:
         if st.button("💾 Export Session Data"):
             if st.session_state.session_history:
                 export_data = {"session_id": st.session_state.current_session_id, "history": st.session_state.session_history}
-                st.download_button("⬇️ Download JSON", data=json.dumps(export_data, indent=2), file_name=f"session_{st.session_state.current_session_id}.json", mime="application/json")
+                st.download_button("⬇️ Download JSON", data=json.dumps(export_data, indent=2, default=str), file_name=f"session_{st.session_state.current_session_id}.json", mime="application/json")
 else:
-    st.info("👈 Start a session from the sidebar to begin.")
+    st.info("👈 Start a session or import your previous session from the sidebar")
     st.markdown("""
-### 🎓 About Mnemosyne
-This conversational AI system is designed for research in therapeutic dialogue and trauma processing.
+### 🎓 About Mnemosyne + PostgreSQL
+**New Features:**
+- ✅ **Permanent session storage** - Sessions survive app restarts
+- ✅ **Import past sessions** - Continue where you left off
+- ✅ **Cloud database** - Data persists forever
 
-**Features:**
-- Session-based conversations with full context retention
-- Multiple therapeutic modalities: Exploratory dialogue, trauma processing, CBT, narrative therapy
-- Powered by Groq API using Llama 3.1 models
-- Full conversation history stored in SQLite database
-- Session summaries and export functionality
+**Getting Started:**
+1. Upload your previous session JSON in the sidebar
+2. Click "Import & Continue Session"
+3. Keep chatting from where you left off!
 
 **Research Use Only**: Ensure proper licensing and supervision for clinical deployment.
 """)
 
 st.markdown("---")
-st.caption(f"🔧 Engine: {MODEL_NAME} (Groq) | 💾 Database: {DB_PATH}")
-
+st.caption(f"🔧 Engine: {MODEL_NAME} (Groq) | 💾 Database: PostgreSQL (Persistent)")
