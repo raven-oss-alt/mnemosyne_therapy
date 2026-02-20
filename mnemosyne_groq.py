@@ -414,13 +414,29 @@ if st.session_state.current_session_id:
         send_button = st.button("📤 Send", use_container_width=True, type="primary", disabled=not GROQ_API_KEY)
 
     if send_button and patient_input.strip():
-        save_turn(st.session_state.current_session_id, "PATIENT", patient_input.strip(), "dialogue")
-        st.session_state.session_history.append({'speaker': 'PATIENT', 'message': patient_input.strip(), 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
-        with st.spinner("Therapist is responding..."):
-            ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
-        save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
-        st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
-        st.rerun()
+        # Check for session end keywords
+        input_lower = patient_input.strip().lower()
+        end_keywords = ["//end", "//close", "//finish", "//done"]
+        
+        if any(keyword in input_lower for keyword in end_keywords):
+            # End session gracefully
+            save_turn(st.session_state.current_session_id, "PATIENT", patient_input.strip(), "dialogue")
+            save_turn(st.session_state.current_session_id, "SYSTEM", "Session ended by patient using keyword command", "session_end")
+            summary = generate_summary(st.session_state.session_history, GROQ_API_KEY)
+            end_session(st.session_state.current_session_id, summary)
+            st.success("✓ Session ended successfully!")
+            st.session_state.current_session_id = None
+            st.session_state.session_history = []
+            st.rerun()
+        else:
+            # Normal conversation flow
+            save_turn(st.session_state.current_session_id, "PATIENT", patient_input.strip(), "dialogue")
+            st.session_state.session_history.append({'speaker': 'PATIENT', 'message': patient_input.strip(), 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
+            with st.spinner("Therapist is responding..."):
+                ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
+            save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
+            st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
+            st.rerun()
 
     st.markdown("### ⚡ Quick Actions")
     a1, a2, a3 = st.columns(3)
@@ -448,11 +464,17 @@ else:
 - ✅ **Permanent session storage** - Sessions survive app restarts
 - ✅ **Import past sessions** - Continue where you left off
 - ✅ **Cloud database** - Data persists forever
+- ✅ **Quick end keywords** - Type `//end`, `//close`, `//finish`, or `//done` to end session instantly
 
 **Getting Started:**
 1. Upload your previous session JSON in the sidebar
 2. Click "Import & Continue Session"
 3. Keep chatting from where you left off!
+
+**Quick Commands:**
+- Type `//end` in chat to end session without clicking button
+- Session auto-saves and generates summary
+- Works in any message
 
 **Research Use Only**: Ensure proper licensing and supervision for clinical deployment.
 """)
