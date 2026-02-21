@@ -440,15 +440,25 @@ if st.session_state.current_session_id:
 
     st.markdown("---")
 
-    # Use form to auto-clear input after submit
-    with st.form(key="message_form", clear_on_submit=True):
-        col1, col2 = st.columns([5, 1])
-        with col1:
-            patient_input = st.text_area("Your response:", height=120, placeholder="Share your thoughts, feelings, or experiences here...", disabled=not GROQ_API_KEY, key="patient_msg_input")
-        with col2:
-            st.write("")
-            st.write("")
-            send_button = st.form_submit_button("📤 Send", use_container_width=True, type="primary", disabled=not GROQ_API_KEY)
+    # Input area with auto-clear
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        # Use session state to control the text area value
+        if 'input_text' not in st.session_state:
+            st.session_state.input_text = ""
+        
+        patient_input = st.text_area(
+            "Your response:", 
+            value=st.session_state.input_text,
+            height=120, 
+            placeholder="Share your thoughts, feelings, or experiences here...", 
+            disabled=not GROQ_API_KEY,
+            key="patient_msg_input"
+        )
+    with col2:
+        st.write("")
+        st.write("")
+        send_button = st.button("📤 Send", use_container_width=True, type="primary", disabled=not GROQ_API_KEY)
 
     if send_button and patient_input and patient_input.strip():
         # Check for session end keywords
@@ -464,6 +474,7 @@ if st.session_state.current_session_id:
             st.success("✓ Session ended successfully!")
             st.session_state.current_session_id = None
             st.session_state.session_history = []
+            st.session_state.input_text = ""  # Clear input
             st.rerun()
         else:
             # Normal conversation flow
@@ -473,6 +484,7 @@ if st.session_state.current_session_id:
                 ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
             save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
             st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
+            st.session_state.input_text = ""  # Clear input after sending
             st.rerun()
 
     st.markdown("### ⚡ Quick Actions")
