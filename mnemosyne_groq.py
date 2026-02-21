@@ -241,14 +241,49 @@ def build_context(history, max_turns=10):
 def generate_ai_response(patient_message, history, mode="exploratory_dialogue", groq_api_key=None):
     if not groq_api_key:
         return "⚠️ API Key not configured."
+    
+    # Crisis detection keywords
+    crisis_keywords = ["suicide", "kill myself", "end my life", "want to die", "harm myself", "self harm", "hurt myself", "no reason to live"]
+    message_lower = patient_message.lower()
+    
+    # Check for crisis language
+    if any(keyword in message_lower for keyword in crisis_keywords):
+        return """I cannot continue this conversation. If you are experiencing thoughts of harming yourself or others, please seek help from a mental health professional or crisis hotline immediately. There are many resources available to help you, including:
+
+1. National Suicide Prevention Lifeline (in the United States): 1-800-273-TALK (8255)
+2. Crisis Text Line (in the United States): Text HOME to 741741
+3. Your immediate healthcare provider or a therapist
+4. Local mental health resources and emergency services
+
+Please reach out for help. There are people who care about you and want to support you through any difficult times you may be facing."""
+    
     system_config = THERAPEUTIC_SYSTEMS.get(mode, THERAPEUTIC_SYSTEMS["exploratory_dialogue"])
-    messages = [{"role": "system", "content": system_config["system_prompt"]}]
+    
+    # Add safety instruction to system prompt
+    enhanced_system_prompt = system_config["system_prompt"] + """
+
+CRITICAL SAFETY RULES:
+- NEVER role-play as threatening, harmful, or menacing entities
+- NEVER use violent, disturbing, or horror-themed language
+- NEVER pretend to harm, poison, or threaten the patient
+- If patient discusses crisis/harm, provide crisis resources immediately
+- Always maintain professional therapeutic boundaries
+- Speak as a compassionate human therapist, not a character"""
+    
+    messages = [{"role": "system", "content": enhanced_system_prompt}]
     messages.extend(build_context(history))
     messages.append({"role": "user", "content": patient_message})
     try:
         response = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"}, json={"model": MODEL_NAME, "messages": messages, "temperature": system_config["temperature"], "max_tokens": 1000, "stream": False}, timeout=30)
         if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content'].strip()
+            ai_text = response.json()['choices'][0]['message']['content'].strip()
+            
+            # Post-filter: check if response is inappropriate
+            inappropriate_patterns = ["rustling sound", "creaking sound", "whispering", "taking over", "you're mine", "can't escape", "poisoning you", "spreading through"]
+            if any(pattern in ai_text.lower() for pattern in inappropriate_patterns):
+                return "I apologize, but I need to maintain appropriate therapeutic boundaries. Let's refocus our conversation. What would you like to talk about today?"
+            
+            return ai_text
         elif response.status_code == 401:
             return "⚠️ Invalid API Key."
         elif response.status_code == 429:
@@ -405,15 +440,17 @@ if st.session_state.current_session_id:
 
     st.markdown("---")
 
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        patient_input = st.text_area("Your response:", height=120, key="patient_input", placeholder="Share your thoughts, feelings, or experiences here...", disabled=not GROQ_API_KEY)
-    with col2:
-        st.write("")
-        st.write("")
-        send_button = st.button("📤 Send", use_container_width=True, type="primary", disabled=not GROQ_API_KEY)
+    # Use form to auto-clear input after submit
+    with st.form(key="message_form", clear_on_submit=True):
+        col1, col2 = st.columns([5, 1])
+        with col1:
+            patient_input = st.text_area("Your response:", height=120, placeholder="Share your thoughts, feelings, or experiences here...", disabled=not GROQ_API_KEY, key="patient_msg_input")
+        with col2:
+            st.write("")
+            st.write("")
+            send_button = st.form_submit_button("📤 Send", use_container_width=True, type="primary", disabled=not GROQ_API_KEY)
 
-    if send_button and patient_input.strip():
+    if send_button and patient_input and patient_input.strip():
         # Check for session end keywords
         input_lower = patient_input.strip().lower()
         end_keywords = ["//end", "//close", "//finish", "//done"]
