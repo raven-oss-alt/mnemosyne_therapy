@@ -323,7 +323,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Session state init
-for key, val in [('current_session_id', None), ('session_history', []), ('therapeutic_mode', 'exploratory_dialogue'), ('groq_api_key', '')]:
+for key, val in [('current_session_id', None), ('session_history', []), ('therapeutic_mode', 'exploratory_dialogue'), ('groq_api_key', ''), ('message_counter', 0)]:
     if key not in st.session_state:
         st.session_state[key] = val
 
@@ -440,20 +440,19 @@ if st.session_state.current_session_id:
 
     st.markdown("---")
 
-    # Input area with auto-clear
+    # Input area with auto-clear using dynamic key
     col1, col2 = st.columns([5, 1])
     with col1:
-        # Use session state to control the text area value
-        if 'input_text' not in st.session_state:
-            st.session_state.input_text = ""
+        # Use a counter to force text area to reset
+        if 'message_counter' not in st.session_state:
+            st.session_state.message_counter = 0
         
         patient_input = st.text_area(
             "Your response:", 
-            value=st.session_state.input_text,
             height=120, 
             placeholder="Share your thoughts, feelings, or experiences here...", 
             disabled=not GROQ_API_KEY,
-            key="patient_msg_input"
+            key=f"patient_input_{st.session_state.message_counter}"  # Dynamic key forces reset
         )
     with col2:
         st.write("")
@@ -474,7 +473,7 @@ if st.session_state.current_session_id:
             st.success("✓ Session ended successfully!")
             st.session_state.current_session_id = None
             st.session_state.session_history = []
-            st.session_state.input_text = ""  # Clear input
+            st.session_state.message_counter += 1  # Increment counter to clear text
             st.rerun()
         else:
             # Normal conversation flow
@@ -484,7 +483,7 @@ if st.session_state.current_session_id:
                 ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
             save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
             st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
-            st.session_state.input_text = ""  # Clear input after sending
+            st.session_state.message_counter += 1  # Increment counter to clear text
             st.rerun()
 
     st.markdown("### ⚡ Quick Actions")
