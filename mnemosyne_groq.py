@@ -51,6 +51,9 @@ def init_db():
             patient_id TEXT,
             summary TEXT
         )''')
+        # Rolling memory columns - added separately so existing tables get upgraded safely
+        cur.execute('''ALTER TABLE sessions ADD COLUMN IF NOT EXISTS rolling_summary TEXT DEFAULT ''  ''')
+        cur.execute('''ALTER TABLE sessions ADD COLUMN IF NOT EXISTS summarized_count INTEGER DEFAULT 0''')
         cur.execute('''CREATE TABLE IF NOT EXISTS conversation_turns (
             id SERIAL PRIMARY KEY,
             session_id INTEGER REFERENCES sessions(id),
@@ -137,6 +140,87 @@ def get_all_sessions():
         return df
     finally:
         conn.close()
+
+# --- ROLLING MEMORY (compressed long-term context within a session) ---
+def get_rolling_memory(session_id):
+    """Return (rolling_summary, summarized_count) for a session."""
+    conn = get_db_connection()
+    if not conn:
+        return "", 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT rolling_summary, summarized_count FROM sessions WHERE id = %s", (session_id,))
+        row = cur.fetchone()
+        if not row:
+            return "", 0
+        return row[0] or "", row[1] or 0
+    finally:
+        conn.close()
+
+def update_rolling_memory(session_id, rolling_summary, summarized_count):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE sessions SET rolling_summary = %s, summarized_count = %s WHERE id = %s",
+                    (rolling_summary, summarized_count, session_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def compress_turns_into_summary(existing_summary, turns_to_compress, groq_api_key):
+    """Merge a chunk of aging-out turns into the existing rolling summary via a small LLM call."""
+    if not groq_api_key or not turns_to_compress:
+        return existing_summary
+
+    chunk_text = "\n".join([f"{t['speaker']}: {t['message']}" for t in turns_to_compress])
+
+    messages = [
+        {"role": "system", "content": (
+            "You maintain a running memory digest for an ongoing therapy conversation. "
+            "Given the EXISTING SUMMARY (may be empty) and a NEW CHUNK of dialogue that is about to "
+            "fall out of the visible chat window, produce ONE updated summary that preserves: "
+            "names mentioned, key facts, ongoing themes/issues, emotional patterns, and anything the "
+            "therapist should remember for continuity. Be concise (under 200 words). "
+            "Do not add commentary, just output the updated summary text."
+        )},
+        {"role": "user", "content": f"EXISTING SUMMARY:\n{existing_summary or '(none yet)'}\n\nNEW CHUNK:\n{chunk_text}\n\nUPDATED SUMMARY:"}
+    ]
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"},
+            json={"model": MODEL_NAME, "messages": messages, "temperature": 0.3, "max_tokens": 300},
+            timeout=30
+        )
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content'].strip()
+        return existing_summary  # fail safe: keep old summary if compression call fails
+    except Exception:
+        return existing_summary
+
+def maintain_rolling_memory(session_id, history, groq_api_key, raw_window=10, chunk_size=10):
+    """
+    Keep the most recent `raw_window` dialogue turns verbatim in context.
+    Anything older gets compressed into a persistent rolling summary once at
+    least `chunk_size` new turns have aged out since the last compression.
+    """
+    dialogue_turns = [t for t in history if t['speaker'] in ('PATIENT', 'THERAPIST')]
+    total = len(dialogue_turns)
+
+    if total <= raw_window:
+        return  # nothing has aged out yet
+
+    existing_summary, summarized_count = get_rolling_memory(session_id)
+
+    # Turns that are old enough to have left the raw window but haven't been summarized yet
+    eligible = dialogue_turns[summarized_count: total - raw_window]
+
+    if len(eligible) >= chunk_size:
+        new_summary = compress_turns_into_summary(existing_summary, eligible, groq_api_key)
+        new_count = summarized_count + len(eligible)
+        update_rolling_memory(session_id, new_summary, new_count)
 
 # --- SESSION IMPORT ---
 def import_session_from_json(json_data):
@@ -238,7 +322,7 @@ def build_context(history, max_turns=10):
             messages.append({"role": "assistant", "content": turn['message']})
     return messages
 
-def generate_ai_response(patient_message, history, mode="exploratory_dialogue", groq_api_key=None):
+def generate_ai_response(patient_message, history, mode="exploratory_dialogue", groq_api_key=None, session_id=None):
     if not groq_api_key:
         return "⚠️ API Key not configured."
     
@@ -259,6 +343,13 @@ Please reach out for help. There are people who care about you and want to suppo
     
     system_config = THERAPEUTIC_SYSTEMS.get(mode, THERAPEUTIC_SYSTEMS["exploratory_dialogue"])
     
+    # Maintain rolling memory BEFORE building context, so older turns that just aged
+    # out of the raw window get folded into the persistent summary
+    rolling_summary = ""
+    if session_id:
+        maintain_rolling_memory(session_id, history, groq_api_key, raw_window=10, chunk_size=10)
+        rolling_summary, _ = get_rolling_memory(session_id)
+    
     # Add safety instruction to system prompt
     enhanced_system_prompt = system_config["system_prompt"] + """
 
@@ -269,9 +360,15 @@ CRITICAL SAFETY RULES:
 - If patient discusses crisis/harm, provide crisis resources immediately
 - Always maintain professional therapeutic boundaries
 - Speak as a compassionate human therapist, not a character"""
+
+    if rolling_summary:
+        enhanced_system_prompt += f"""
+
+CONTEXT FROM EARLIER IN THIS SESSION (for continuity - use naturally, don't recite it verbatim):
+{rolling_summary}"""
     
     messages = [{"role": "system", "content": enhanced_system_prompt}]
-    messages.extend(build_context(history))
+    messages.extend(build_context(history, max_turns=10))
     messages.append({"role": "user", "content": patient_message})
     try:
         response = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"}, json={"model": MODEL_NAME, "messages": messages, "temperature": system_config["temperature"], "max_tokens": 1000, "stream": False}, timeout=30)
@@ -367,6 +464,13 @@ with st.sidebar:
 
     if st.session_state.current_session_id:
         st.success(f"✓ Active Session #{st.session_state.current_session_id}")
+
+        # Researcher visibility into what's been compressed into long-term memory
+        _rs, _rc = get_rolling_memory(st.session_state.current_session_id)
+        if _rs:
+            with st.expander(f"🧠 Rolling Memory ({_rc} turns compressed)", expanded=False):
+                st.caption("Older turns folded into this summary once they age out of the raw context window.")
+                st.write(_rs)
 
         mode_labels = {
             "exploratory_dialogue": "🗣️ Exploratory Dialogue",
@@ -467,7 +571,7 @@ if st.session_state.current_session_id:
             save_turn(st.session_state.current_session_id, "PATIENT", patient_input.strip(), "dialogue")
             st.session_state.session_history.append({'speaker': 'PATIENT', 'message': patient_input.strip(), 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
             with st.spinner("Therapist is responding..."):
-                ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
+                ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY, session_id=st.session_state.current_session_id)
             save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
             st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
             st.rerun()
