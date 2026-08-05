@@ -430,36 +430,24 @@ if st.session_state.current_session_id:
     if not st.session_state.session_history:
         st.session_state.session_history = get_session_history(st.session_state.current_session_id)
 
+    # Chat container - st.chat_message auto-scrolls to the latest message
     for turn in st.session_state.session_history:
         if turn['speaker'] == "PATIENT":
-            st.markdown(f'<div class="patient-message"><strong>Patient:</strong><br>{turn["message"]}</div>', unsafe_allow_html=True)
+            with st.chat_message("user"):
+                st.markdown(turn["message"])
         elif turn['speaker'] == "THERAPIST":
-            st.markdown(f'<div class="therapist-message"><strong>Therapist:</strong><br>{turn["message"]}</div>', unsafe_allow_html=True)
+            with st.chat_message("assistant"):
+                st.markdown(turn["message"])
         elif turn['speaker'] == "SYSTEM":
             st.markdown(f'<div class="system-message">🔔 {turn["message"]}</div>', unsafe_allow_html=True)
 
-    st.markdown("---")
+    # st.chat_input pins to the bottom, submits on Enter, and supports Shift+Enter for a new line
+    patient_input = st.chat_input(
+        "Share your thoughts, feelings, or experiences here... (Enter to send, Shift+Enter for new line)",
+        disabled=not GROQ_API_KEY
+    )
 
-    # Input area with auto-clear using dynamic key
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        # Use a counter to force text area to reset
-        if 'message_counter' not in st.session_state:
-            st.session_state.message_counter = 0
-        
-        patient_input = st.text_area(
-            "Your response:", 
-            height=120, 
-            placeholder="Share your thoughts, feelings, or experiences here...", 
-            disabled=not GROQ_API_KEY,
-            key=f"patient_input_{st.session_state.message_counter}"  # Dynamic key forces reset
-        )
-    with col2:
-        st.write("")
-        st.write("")
-        send_button = st.button("📤 Send", use_container_width=True, type="primary", disabled=not GROQ_API_KEY)
-
-    if send_button and patient_input and patient_input.strip():
+    if patient_input and patient_input.strip():
         # Check for session end keywords
         input_lower = patient_input.strip().lower()
         end_keywords = ["//end", "//close", "//finish", "//done"]
@@ -473,7 +461,6 @@ if st.session_state.current_session_id:
             st.success("✓ Session ended successfully!")
             st.session_state.current_session_id = None
             st.session_state.session_history = []
-            st.session_state.message_counter += 1  # Increment counter to clear text
             st.rerun()
         else:
             # Normal conversation flow
@@ -483,7 +470,6 @@ if st.session_state.current_session_id:
                 ai_response = generate_ai_response(patient_input.strip(), st.session_state.session_history, mode=st.session_state.therapeutic_mode, groq_api_key=GROQ_API_KEY)
             save_turn(st.session_state.current_session_id, "THERAPIST", ai_response, "dialogue")
             st.session_state.session_history.append({'speaker': 'THERAPIST', 'message': ai_response, 'message_type': 'dialogue', 'timestamp': datetime.datetime.now()})
-            st.session_state.message_counter += 1  # Increment counter to clear text
             st.rerun()
 
     st.markdown("### ⚡ Quick Actions")
